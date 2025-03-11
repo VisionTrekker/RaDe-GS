@@ -16,6 +16,8 @@ from scene.dataset_readers import sceneLoadTypeCallbacks
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 import json
 
+from PIL import Image
+from utils.vis_utils import apply_depth_colormap
 
 def load_camera(args):
     if os.path.exists(os.path.join(args.source_path, "sparse")):
@@ -25,6 +27,12 @@ def load_camera(args):
         scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)
     return cameraList_from_camInfos(scene_info.train_cameras, 1.0, args)
 
+def save_img_u8(img, pth):
+  """Save an image (probably RGB) in [0, 1] to disk as a uint8 PNG."""
+  with open(pth, 'wb') as f:
+    Image.fromarray(
+        (np.clip(np.nan_to_num(img), 0., 1.) * 255.).astype(np.uint8)).save(
+            f, 'PNG')
 
 
 
@@ -38,6 +46,8 @@ def extract_mesh(dataset, pipe, checkpoint_iterations=None):
     else:
         iteration = checkpoint_iterations
     output_path = os.path.join(output_path,"iteration_"+str(iteration),"point_cloud.ply")
+    assert os.path.exists(output_path), "{} does not exist".format(output_path)
+
 
     gaussians.load_ply(output_path)
     print(f'Loaded gaussians from {output_path}')
@@ -48,10 +58,15 @@ def extract_mesh(dataset, pipe, checkpoint_iterations=None):
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
     viewpoint_cam_list = load_camera(dataset)
 
+    print(f'Loaded cameras from colmap')
+
+    render_image_folder = os.path.join(dataset.model_path, "train", "ours_{}".format(iteration), "renders")
+    os.makedirs(render_image_folder, exist_ok=True)
+
     depth_list = []
     color_list = []
     alpha_thres = 0.5
-    for viewpoint_cam in viewpoint_cam_list:
+    for idx, viewpoint_cam in enumerate(viewpoint_cam_list):
         # Rendering offscreen from that camera 
         render_pkg = render(viewpoint_cam, gaussians, pipe, background, kernel_size)
         rendered_img = torch.clamp(render_pkg["render"], min=0, max=1.0).cpu().numpy().transpose(1,2,0)
@@ -62,8 +77,17 @@ def extract_mesh(dataset, pipe, checkpoint_iterations=None):
         depth[render_pkg["mask"]<alpha_thres] = 0
         depth_list.append(depth[0].cpu().numpy())
 
+        rendered_depth = render_pkg["depth"]
+        rendered_mask = render_pkg["mask"]
+        plt.imshow(apply_depth_colormap(rendered_depth[0, ..., None], rendered_mask[0, ..., None]).detach().cpu().numpy())
+
+        # 保存图片
+        save_img_u8(rendered_img.transpose((1,2,0)), os.path.join(render_image_folder, '{0:05d}'.format(idx) + ".png"))
+
+    print("rendered image and depth from 3DGS")
+
     torch.cuda.empty_cache()
-    voxel_size = 0.002
+    voxel_size = 0.02   # 原值为0.002，当场景太大，可尝试增大该值
     o3d_device = o3d.core.Device("CPU:0")
     vbg = o3d.t.geometry.VoxelBlockGrid(attr_names=('tsdf', 'weight', 'color'),
                                             attr_dtypes=(o3c.float32,
